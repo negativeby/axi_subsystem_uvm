@@ -335,8 +335,7 @@ module subsystem_top #(
         .m_axi_rresp(dma_axi_rresp),
         .m_axi_rlast(dma_axi_rlast),
         .m_axi_rvalid(dma_axi_rvalid),
-        .m_axi_rready(dma_axi_rready),
-        .enable(1'b1)
+        .m_axi_rready(dma_axi_rready)
     );
 
     // ==============================================================
@@ -506,8 +505,7 @@ module subsystem_top #(
         .AXI_DATA_WIDTH(DATA_WIDTH),
         .AXI_ID_WIDTH(M_ID_WIDTH),
         .AXIL_DATA_WIDTH(32),
-        .CONVERT_BURST(1),
-        .CONVERT_NARROW(1)
+        .CONVERT_BURST(1)
     ) u_bridge (
         .clk(clk),
         .rst(rst),
