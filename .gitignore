@@ -1,0 +1,21 @@
+# VCS 编译与仿真生成的临时文件夹与二进制文件
+simv*
+csrc/
+*.daidir/
+*.so
+*.o
+
+# Verdi 与波形数据库
+*.fsdb
+verdiLog/
+novas.*
+ucli.key
+*.key
+DVEfiles/
+
+# 仿真与编译日志
+*.log
+
+# 编辑器临时备份文件
+*~
+*.swp
