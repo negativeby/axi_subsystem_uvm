@@ -1,35 +1,75 @@
-# ==============================================================================
-# Makefile for AXI Subsystem UVM Verification Platform
-# ==============================================================================
+# ==============================================================
+# AXI4 UVM 验证平台 Makefile
+# ==============================================================
 
-VCS      = vcs
-VERDI    = verdi
+PROJ_ROOT  ?= $(shell cd .. && pwd)
+TEST       ?= base_test
+VERB       ?= UVM_LOW
+SEED       ?= 1
 
-# 加入 -error=noZMMCM 和 -error=noIRIPS，放行适配器不可达分支的语法告警
-VCS_FLAGS = -sverilog -full64 -timescale=1ns/1ps \
-            -ntb_opts uvm-1.2 \
-            -debug_access+all -kdb -lca \
-            +v2k \
-            -error=noZMMCM \
-            -error=noIRIPS \
-            -LDFLAGS -Wl,--no-as-needed
+export VERDI_HOME ?= /home/synopsys/verdi/Verdi_O-2018.09-SP2
 
-INCDIR    = +incdir+../rtl +incdir+../vip +incdir+../tb +incdir+../tests
+# 路径包含
+INCDIRS    = +incdir+$(PROJ_ROOT)/tb \
+             +incdir+$(PROJ_ROOT)/vip \
+             +incdir+$(PROJ_ROOT)/tests \
+             +incdir+$(PROJ_ROOT)/rtl
 
-FILE_LIST = ../vip/axi_if.sv ../vip/axi_transfer.sv ../rtl/*.v ../tb/tb_top.sv ./vcs_fix.c
+# 源码入口
+# 源码入口 (按依赖先后顺序编译)
+RTL_FILES  = $(wildcard $(PROJ_ROOT)/rtl/*.v)
+TB_FILES   = $(PROJ_ROOT)/vip/axi_if.sv \
+             $(PROJ_ROOT)/vip/axi_vip_pkg.sv \
+             $(PROJ_ROOT)/tests/axi_random_sequence.sv \
+             $(PROJ_ROOT)/tests/base_test.sv \
+             $(PROJ_ROOT)/tests/random_test.sv \
+             $(PROJ_ROOT)/tb/tb_top.sv
 
-TESTNAME ?= base_test
+# 兼容性目标文件
+SHIM_OBJ   = $(PROJ_ROOT)/sim/pthread_yield.o
 
-all: comp run
+# 强制链接器禁止裁剪间接依赖库
+LD_FLAGS   = -Wl,--no-as-needed
 
+# VCS 编译选项
+VCS_FLAGS  = -full64 \
+             -sverilog \
+             -ntb_opts uvm-1.2 \
+             -timescale=1ns/1ps \
+             -debug_pp \
+             -fsdb \
+             -LDFLAGS "$(LD_FLAGS)" \
+             -cm line+cond+fsm+tgl+branch+assert \
+             -l comp.log \
+             $(INCDIRS)
+
+# 仿真运行选项
+SIM_FLAGS  = +UVM_TESTNAME=$(TEST) \
+             +UVM_VERBOSITY=$(VERB) \
+             +ntb_random_seed=$(SEED) \
+             -cm line+cond+fsm+tgl+branch+assert \
+             -cm_name $(TEST)_seed_$(SEED) \
+             -l sim_$(TEST).log
+
+.PHONY: all comp run urg clean
+
+all: comp run urg
+
+# 目标 1: 编译链接
 comp:
-	$(VCS) $(VCS_FLAGS) $(INCDIR) $(FILE_LIST) -l compile.log
+	vcs $(VCS_FLAGS) $(RTL_FILES) $(TB_FILES) $(SHIM_OBJ) -o simv
 
+# 目标 2: 动态仿真
 run:
-	./simv +UVM_TESTNAME=$(TESTNAME) +UVM_VERBOSITY=UVM_MEDIUM -l sim.log
+	./simv $(SIM_FLAGS)
 
-verdi:
-	$(VERDI) -ssf tb_top.fsdb $(INCDIR) $(FILE_LIST) &
+# 目标 3: 生成 URG 覆盖率网页报表
+urg:
+	urg -dir simv.vdb -format both -report urgReport
+	@echo "=========================================================="
+	@echo "覆盖率网页报表生成完毕: 请在终端输入 firefox urgReport/dashboard.html 查看"
+	@echo "=========================================================="
 
+# 目标 4: 清理
 clean:
-	rm -rf simv* csrc* *.log *.key *.fsdb verdiLog novas.* ucli.key DVEfiles vcs_fix.o
+	rm -rf simv* csrc *.log *.key *.fsdb *.vdb urgReport ucli.key vc_hdrs.h novas.* verdiLog vdCovLog
