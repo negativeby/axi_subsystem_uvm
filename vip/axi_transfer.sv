@@ -26,7 +26,6 @@ class axi_transfer #(
     rand bit [3:0]             cache;
     rand bit [2:0]             prot;
 
-    // 采用 SystemVerilog 队列 (Queue)，完美支持流式采样与 push_back
     rand bit [DATA_WIDTH-1:0] data[$];
     rand bit [STRB_WIDTH-1:0] strb[$];
 
@@ -49,19 +48,22 @@ class axi_transfer #(
         `uvm_field_int(rresp,      UVM_ALL_ON)
     `uvm_object_utils_end
 
-    constraint c_default_cfg {
-        burst == 2'b01;
-        size  == 3'b011;
-        len inside {[0:15]};
-        lock  == 1'b0;
-        cache == 4'b0011;
-        prot  == 3'b000;
-
+    constraint c_struct_cfg {
         data.size() == len + 1;
         strb.size() == len + 1;
+    }
+
+    // 核心重构: 将 soft 约束扩展至协议完整物理空间，避免对 sequence 的 hard dist 产生偏置截断
+    constraint c_default_cfg {
+        soft burst == 2'b01;
+        soft size inside {[0 : 3]};   // 物理支持 1B, 2B, 4B, 8B
+        soft len  inside {[0 : 31]};  // 物理支持 1~32 拍，覆盖 long_burst
+        soft lock  == 1'b0;
+        soft cache == 4'b0011;
+        soft prot  == 3'b000;
 
         foreach (strb[i]) {
-            strb[i] == {STRB_WIDTH{1'b1}};
+            soft strb[i] == {STRB_WIDTH{1'b1}};
         }
     }
 

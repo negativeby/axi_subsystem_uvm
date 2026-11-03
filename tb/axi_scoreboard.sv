@@ -14,18 +14,14 @@ class axi_scoreboard #(
     localparam STRB_WIDTH = DATA_WIDTH / 8;
     localparam BYTES_PER_BEAT = DATA_WIDTH / 8;
 
-    // 声明 TLM 接收端口 (Imp)
-    // 模板参数 1: 传输的事务类型
-    // 模板参数 2: 实现 write 方法的宿主类 (即当前 Scoreboard 自身)
     uvm_analysis_imp #(
         axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH),
         axi_scoreboard #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)
     ) item_collected_export;
 
-    // 黄金参考模型：按字节寻址的稀疏关联数组
+    // 黄金内存参考模型：按绝对物理字节地址索引的关联数组
     bit [7:0] golden_mem[bit [ADDR_WIDTH-1:0]];
 
-    // 统计计数器
     int unsigned write_trans_cnt = 0;
     int unsigned read_trans_cnt  = 0;
     int unsigned match_cnt       = 0;
@@ -38,9 +34,6 @@ class axi_scoreboard #(
         item_collected_export = new("item_collected_export", this);
     endfunction: new
 
-    // ==============================================================
-    // TLM 回调函数：只要 Monitor 发送 write(tr)，本函数立即被触发
-    // ==============================================================
     virtual function void write(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
         if (tr.trans_type == AXI_WRITE) begin
             process_write(tr);
@@ -49,72 +42,81 @@ class axi_scoreboard #(
         end
     endfunction: write
 
-    // 处理写事务：按拍解析字节地址，结合 wstrb 写入 Golden Memory
+    // ------------------------------------------------------------------
+    // 处理写事务: 修复双重偏移 Bug，严谨映射物理总线字节通道
+    // ------------------------------------------------------------------
     virtual function void process_write(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
         bit [ADDR_WIDTH-1:0] beat_addr;
+        bit [ADDR_WIDTH-1:0] word_base_addr;
         int unsigned bytes_in_transfer = (1 << tr.size);
 
         write_trans_cnt++;
 
         for (int i = 0; i <= tr.len; i++) begin
-            // 简化的 INCR 模式地址递增推导
-            beat_addr = tr.addr + (i * bytes_in_transfer);
+            beat_addr      = tr.addr + (i * bytes_in_transfer);
+            // 提取当前拍所在的 64-bit 对齐基地址 (低 3 位清零)
+            word_base_addr = {beat_addr[ADDR_WIDTH-1:3], 3'b000};
 
             for (int b = 0; b < BYTES_PER_BEAT; b++) begin
-                // 仅当对应的字节选通掩码有效时，才更新对应字节
+                // 仅当该字节通道使能为 1 时，写入对应的绝对物理地址
                 if (tr.strb[i][b]) begin
-                    golden_mem[beat_addr + b] = tr.data[i][(b*8) +: 8];
+                    golden_mem[word_base_addr + b] = tr.data[i][(b*8) +: 8];
                 end
             end
         end
 
-        `uvm_info("SCB_WR", $sformatf("成功登记写事务: Addr=0x%08h, Len=%0d, 写入数据拍数=%0d", 
-                  tr.addr, tr.len, tr.data.size()), UVM_HIGH)
+        `uvm_info("SCB_WR", $sformatf("登记写事务: Addr=0x%08h, Len=%0d, Size=%0d", 
+                  tr.addr, tr.len, tr.size), UVM_HIGH)
     endfunction: process_write
 
-    // 处理读事务：从 Golden Memory 提取期望值，与 DUT 返回的 rdata 逐拍对比
+    // ------------------------------------------------------------------
+    // 处理读事务: 仅对账 size 范围内有效字节通道，彻底消除窄传输假报错
+    // ------------------------------------------------------------------
     virtual function void process_read(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
         bit [ADDR_WIDTH-1:0] beat_addr;
-        bit [DATA_WIDTH-1:0] expected_data;
+        bit [ADDR_WIDTH-1:0] curr_byte_addr;
+        bit [2:0] byte_lane;
         bit [7:0] exp_byte;
+        bit [7:0] act_byte;
+        bit       beat_error;
         int unsigned bytes_in_transfer = (1 << tr.size);
 
         read_trans_cnt++;
 
         for (int i = 0; i <= tr.len; i++) begin
-            beat_addr = tr.addr + (i * bytes_in_transfer);
-            expected_data = '0;
+            beat_addr  = tr.addr + (i * bytes_in_transfer);
+            beat_error = 1'b0;
 
-            // 从关联数组中拼装出整拍数据
-            for (int b = 0; b < BYTES_PER_BEAT; b++) begin
-                if (golden_mem.exists(beat_addr + b)) begin
-                    exp_byte = golden_mem[beat_addr + b];
+            // 仅遍历并比对当前拍真正被请求的有效字节 (2^size 字节)
+            for (int k = 0; k < bytes_in_transfer; k++) begin
+                curr_byte_addr = beat_addr + k;
+                byte_lane      = curr_byte_addr[2:0]; // 确定该字节在 64 位总线上的物理通道
+
+                if (golden_mem.exists(curr_byte_addr)) begin
+                    exp_byte = golden_mem[curr_byte_addr];
                 end else begin
-                    exp_byte = 8'h00; // 硬件未初始化内存默认读回 0
+                    exp_byte = 8'h00; // 未初始化物理空间默认为 0
                 end
-                expected_data[(b*8) +: 8] = exp_byte;
+
+                act_byte = tr.data[i][(byte_lane * 8) +: 8];
+
+                if (act_byte !== exp_byte) begin
+                    beat_error = 1'b1;
+                    `uvm_error("SCB_MISMATCH", $sformatf(
+                        "数据不符! Beat[%0d] ByteAddr=0x%08h Lane=%0d | 期望值=0x%02h, 实际读出=0x%02h",
+                        i, curr_byte_addr, byte_lane, exp_byte, act_byte
+                    ))
+                end
             end
 
-            // 核心对账比对
-            if (tr.data[i] !== expected_data) begin
+            if (beat_error) begin
                 mismatch_cnt++;
-                `uvm_error("SCB_MISMATCH", $sformatf(
-                    "数据比对不符! Beat[%0d] Addr=0x%08h | 期望值(Golden)=0x%016h, 实际值(DUT)=0x%016h",
-                    i, beat_addr, expected_data, tr.data[i]
-                ))
             end else begin
                 match_cnt++;
-                `uvm_info("SCB_MATCH", $sformatf(
-                    "数据比对吻合: Beat[%0d] Addr=0x%08h Data=0x%016h", 
-                    i, beat_addr, tr.data[i]
-                ), UVM_HIGH)
             end
         end
     endfunction: process_read
 
-    // ==============================================================
-    // check_phase: 仿真结束前做统计汇总与断言核验
-    // ==============================================================
     virtual function void check_phase(uvm_phase phase);
         super.check_phase(phase);
         `uvm_info("SCB_SUMMARY", "==================================================", UVM_LOW)
