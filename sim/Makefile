@@ -20,10 +20,10 @@ INCDIRS    = +incdir+$(PROJ_ROOT)/tb \
 RTL_FILES  = $(wildcard $(PROJ_ROOT)/rtl/*.v)
 TB_FILES   = $(PROJ_ROOT)/vip/axi_if.sv \
              $(PROJ_ROOT)/vip/axi_vip_pkg.sv \
-             $(PROJ_ROOT)/tests/axi_random_sequence.sv \
+             $(PROJ_ROOT)/tests/axi_concurrent_sequence.sv \
              $(PROJ_ROOT)/tests/base_test.sv \
-             $(PROJ_ROOT)/tests/random_test.sv \
-             $(PROJ_ROOT)/tb/tb_top.sv
+             $(PROJ_ROOT)/tests/concurrent_test.sv \
+             $(PROJ_ROOT)/tb/tb_top.sv 
 
 # 兼容性目标文件
 SHIM_OBJ   = $(PROJ_ROOT)/sim/pthread_yield.o
@@ -65,7 +65,7 @@ run:
 
 # 目标 3: 生成 URG 覆盖率网页报表
 urg:
-	urg -dir simv.vdb -format both -report urgReport
+	urg -dir simv.vdb -report urgReport
 	@echo "=========================================================="
 	@echo "覆盖率网页报表生成完毕: 请在终端输入 firefox urgReport/dashboard.html 查看"
 	@echo "=========================================================="

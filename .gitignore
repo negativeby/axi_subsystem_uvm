@@ -1,17 +1,22 @@
-sim/simv*
-sim/csrc/
-sim/*.daidir/
-sim/*.o
-sim/vc_hdrs.h
-sim/*.log
-sim/*.key
-sim/*.fsdb
-sim/novas.*
-sim/verdiLog/
-sim/vdCovLog/
-sim/ucli.key
-sim/*.vdb/
-sim/urgReport/
+# VCS 编译与仿真产物
+simv*
+csrc/
+*.daidir/
+*.key
+*.log
+vc_hdrs.h
+
+# 覆盖率数据库与报表
+*.vdb/
+urgReport/
+vdCovLog/
+
+# Verdi / Novas 波形与日志
+*.fsdb
+novas.*
+verdiLog/
+
+# 临时文件
 *~
 *.swp
-*.bak
+*.o
