@@ -5,17 +5,15 @@
 import uvm_pkg::*;
 
 class axi_monitor #(
-    parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 64,
-    parameter ID_WIDTH   = 8
+    parameter int ADDR_WIDTH = 32,
+    parameter int DATA_WIDTH = 64,
+    parameter int ID_WIDTH   = 8
 ) extends uvm_monitor;
 
     localparam STRB_WIDTH = DATA_WIDTH / 8;
 
-    // 虚拟接口指针
     virtual axi_if #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) vif;
 
-    // TLM 广播端口：将采集到的完整 AXI 事务发送给 Scoreboard 与 Coverage
     uvm_analysis_port #(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)) item_collected_port;
 
     `uvm_component_param_utils(axi_monitor #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH))
@@ -35,12 +33,10 @@ class axi_monitor #(
     virtual task run_phase(uvm_phase phase);
         super.run_phase(phase);
 
-        // 等待系统复位释放
         wait(vif.rst_n === 1'b1);
         @(posedge vif.clk);
-        `uvm_info("AXI_MON", "Monitor 监测到系统复位释放，启动总线被动采样", UVM_MEDIUM)
+        `uvm_info("AXI_MON", "Monitor 检测到复位释放，启动多 Outstanding 异步流水采样引擎", UVM_MEDIUM)
 
-        // 读通道和写通道在硬件上完全独立，启动两个并行的监听进程
         fork
             collect_write_trans();
             collect_read_trans();
@@ -48,95 +44,145 @@ class axi_monitor #(
     endtask: run_phase
 
     // ==============================================================
-    // 写通道采样线程：AW -> W(直到 WLAST) -> B
+    // 写通道采样引擎: 完整支持 AW 与 W 任意顺序到达 (W-before-AW)
     // ==============================================================
     virtual task collect_write_trans();
-        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr;
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) aw_pending_q[$];
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) b_pending_q[$];
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) aw_tr;
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) cur_w_tr;
+
+        // 抢跑缓冲: 暂存先于 AW 到达的 W 数据流
+        bit [DATA_WIDTH-1:0] pre_w_data[$];
+        bit [STRB_WIDTH-1:0] pre_w_strb[$];
+        bit                  pre_w_last_seen = 1'b0;
 
         forever begin
-            tr = axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)::type_id::create("mon_wr_tr");
-            tr.trans_type = AXI_WRITE;
+            @(posedge vif.clk);
 
-            // AW 与 W 通道物理解耦，使用 fork...join 并发捕获
-            fork
-                begin
-                    do begin
-                        @(posedge vif.clk);
-                    end while (!(vif.awvalid === 1'b1 && vif.awready === 1'b1));
+            // 1. 采样 AW 握手
+            if (vif.awvalid === 1'b1 && vif.awready === 1'b1) begin
+                aw_tr = axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)::type_id::create("mon_wr_tr");
+                aw_tr.trans_type = AXI_WRITE;
+                aw_tr.id    = vif.awid;
+                aw_tr.addr  = vif.awaddr;
+                aw_tr.len   = vif.awlen;
+                aw_tr.size  = vif.awsize;
+                aw_tr.burst = vif.awburst;
+                aw_tr.lock  = vif.awlock;
+                aw_tr.cache = vif.awcache;
+                aw_tr.prot  = vif.awprot;
 
-                    tr.id    = vif.awid;
-                    tr.addr  = vif.awaddr;
-                    tr.len   = vif.awlen;
-                    tr.size  = vif.awsize;
-                    tr.burst = vif.awburst;
-                    tr.lock  = vif.awlock;
-                    tr.cache = vif.awcache;
-                    tr.prot  = vif.awprot;
-                end
-                begin
-                    while (1) begin
-                        @(posedge vif.clk);
-                        if (vif.wvalid === 1'b1 && vif.wready === 1'b1) begin
-                            tr.data.push_back(vif.wdata);
-                            tr.strb.push_back(vif.wstrb);
-                            if (vif.wlast === 1'b1) begin
-                                break;
-                            end
-                        end
+                // 若之前已有数据拍抢跑握手，合并数据
+                if (pre_w_data.size() > 0) begin
+                    aw_tr.data = pre_w_data;
+                    aw_tr.strb = pre_w_strb;
+                    pre_w_data.delete();
+                    pre_w_strb.delete();
+
+                    if (pre_w_last_seen) begin
+                        pre_w_last_seen = 1'b0;
+                        b_pending_q.push_back(aw_tr); // 数据已全收齐，直接转入待响应队列
+                    end else begin
+                        aw_pending_q.push_back(aw_tr); // 尚有后续数据拍未完，入队继续等待
                     end
+                end else begin
+                    aw_pending_q.push_back(aw_tr);
                 end
-            join
+            end
 
-            // 等待 B 通道写响应
-            do begin
-                @(posedge vif.clk);
-            end while (!(vif.bvalid === 1'b1 && vif.bready === 1'b1));
+            // 2. 采样 W 握手
+            if (vif.wvalid === 1'b1 && vif.wready === 1'b1) begin
+                if (aw_pending_q.size() > 0) begin
+                    cur_w_tr = aw_pending_q[0];
+                    cur_w_tr.data.push_back(vif.wdata);
+                    cur_w_tr.strb.push_back(vif.wstrb);
 
-            tr.bresp = vif.bresp;
-
-            // 广播完整事务
-            item_collected_port.write(tr);
-        end
-    endtask: collect_write_trans
-
-    // ==============================================================
-    // 读通道采样线程：AR -> R(直到 RLAST)
-    // ==============================================================
-    virtual task collect_read_trans();
-        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr;
-
-        forever begin
-            tr = axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)::type_id::create("mon_rd_tr");
-            tr.trans_type = AXI_READ;
-
-            // 1. 监测读地址握手 (ARVALID & ARREADY 同时有效)
-            do begin
-                @(posedge vif.clk);
-            end while (!(vif.arvalid === 1'b1 && vif.arready === 1'b1));
-
-            tr.id    = vif.arid;
-            tr.addr  = vif.araddr;
-            tr.len   = vif.arlen;
-            tr.size  = vif.arsize;
-            tr.burst = vif.arburst;
-            tr.lock  = vif.arlock;
-            tr.cache = vif.arcache;
-            tr.prot  = vif.arprot;
-
-            // 2. 连续收集读数据拍 (RVALID & RREADY 同时有效)
-            while (1) begin
-                @(posedge vif.clk);
-                if (vif.rvalid === 1'b1 && vif.rready === 1'b1) begin
-                    tr.data.push_back(vif.rdata);
-                    tr.rresp = vif.rresp;
-                    if (vif.rlast === 1'b1) begin
-                        break; // 最后一拍读数据采集完毕
+                    if (vif.wlast === 1'b1) begin
+                        void'(aw_pending_q.pop_front());
+                        b_pending_q.push_back(cur_w_tr);
+                    end
+                end else begin
+                    // AW 尚未握手，存入抢跑缓冲
+                    pre_w_data.push_back(vif.wdata);
+                    pre_w_strb.push_back(vif.wstrb);
+                    if (vif.wlast === 1'b1) begin
+                        pre_w_last_seen = 1'b1;
                     end
                 end
             end
 
-            // 3. 将完整读事务广播发送
-            item_collected_port.write(tr);
+            // 3. 采样 B 握手
+            if (vif.bvalid === 1'b1 && vif.bready === 1'b1) begin
+                int match_idx = -1;
+                for (int i = 0; i < b_pending_q.size(); i++) begin
+                    if (b_pending_q[i].id == vif.bid) begin
+                        match_idx = i;
+                        break;
+                    end
+                end
+
+                if (match_idx == -1) begin
+                    `uvm_error("MON_B_ORPHAN", $sformatf("收到未匹配写事务的孤儿响应！BID=0x%0h", vif.bid))
+                end else begin
+                    axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) b_tr = b_pending_q[match_idx];
+                    b_tr.bresp = vif.bresp;
+                    b_pending_q.delete(match_idx);
+                    item_collected_port.write(b_tr);
+                end
+            end
+        end
+    endtask: collect_write_trans
+
+    // ==============================================================
+    // 读通道采样引擎
+    // ==============================================================
+    virtual task collect_read_trans();
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) ar_pending_q[$];
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) ar_tr;
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) cur_rd_tr;
+
+        forever begin
+            @(posedge vif.clk);
+
+            // 1. 采样 AR 握手
+            if (vif.arvalid === 1'b1 && vif.arready === 1'b1) begin
+                ar_tr = axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)::type_id::create("mon_rd_tr");
+                ar_tr.trans_type = AXI_READ;
+                ar_tr.id    = vif.arid;
+                ar_tr.addr  = vif.araddr;
+                ar_tr.len   = vif.arlen;
+                ar_tr.size  = vif.arsize;
+                ar_tr.burst = vif.arburst;
+                ar_tr.lock  = vif.arlock;
+                ar_tr.cache = vif.arcache;
+                ar_tr.prot  = vif.arprot;
+                ar_pending_q.push_back(ar_tr);
+            end
+
+            // 2. 采样 R 握手
+            if (vif.rvalid === 1'b1 && vif.rready === 1'b1) begin
+                int match_idx = -1;
+                for (int i = 0; i < ar_pending_q.size(); i++) begin
+                    if (ar_pending_q[i].id == vif.rid) begin
+                        match_idx = i;
+                        break;
+                    end
+                end
+
+                if (match_idx == -1) begin
+                    `uvm_error("MON_R_ORPHAN", $sformatf("收到未匹配 AR 地址的孤儿读数据！RID=0x%0h", vif.rid))
+                end else begin
+                    cur_rd_tr = ar_pending_q[match_idx];
+                    cur_rd_tr.data.push_back(vif.rdata);
+                    cur_rd_tr.rresp = vif.rresp;
+
+                    if (vif.rlast === 1'b1) begin
+                        ar_pending_q.delete(match_idx);
+                        item_collected_port.write(cur_rd_tr);
+                    end
+                end
+            end
         end
     endtask: collect_read_trans
 
