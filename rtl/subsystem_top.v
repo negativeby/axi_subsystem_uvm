@@ -156,7 +156,8 @@ module subsystem_top #(
         .M_ADDR_WIDTH({32'd12, 32'd15}),
         .M_BASE_ADDR({32'h0001_0000, 32'h0000_0000}),
         .M_CONNECT_READ(4'b1111),
-        .M_CONNECT_WRITE(4'b1111)
+        .M_CONNECT_WRITE(4'b1111),
+        .S_W_REG_TYPE({S_COUNT{2'd2}})
     ) u_crossbar (
         .clk(clk),
         .rst(rst),

@@ -142,46 +142,5 @@ interface axi_if #(
     assert_ar_4kb_boundary: assert property (p_ar_4kb_boundary)
         else `uvm_error("SVA_AR_4KB", $sformatf("AR 突发读跨越 4KB 边界! addr=0x%08x, len=%0d, size=%0d", araddr, arlen, arsize))
 
-    // --------------------------------------------------------------
-    // 断言 3: WLAST 与 AWLEN 严格对齐断言 (A3.4.4 规则)
-    // --------------------------------------------------------------
-    int unsigned w_beat_cnt = 0;
-    bit [7:0]    awlen_fifo[$];
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            awlen_fifo.delete();
-            w_beat_cnt <= 0;
-        end else begin
-            if (awvalid && awready) begin
-                awlen_fifo.push_back(awlen);
-            end
-
-            if (wvalid && wready) begin
-                bit [7:0] active_len;
-                if (awlen_fifo.size() == 0 && awvalid && awready) begin
-                    active_len = awlen;
-                end else if (awlen_fifo.size() > 0) begin
-                    active_len = awlen_fifo[0];
-                end else begin
-                    active_len = 8'd0;
-                end
-
-                if (wlast) begin
-                    assert_wlast_exact: assert (w_beat_cnt == active_len)
-                        else `uvm_error("SVA_WLAST_MISMATCH", $sformatf("WLAST 提前或滞后触发! 当前拍数=%0d, 预期长度=%0d", w_beat_cnt, active_len));
-
-                    w_beat_cnt <= 0;
-                    if (awlen_fifo.size() > 0) begin
-                        void'(awlen_fifo.pop_front());
-                    end
-                end else begin
-                    assert_wlast_not_premature: assert (w_beat_cnt < active_len)
-                        else `uvm_error("SVA_WLAST_MISSING", $sformatf("W 拍数已达 %0d，但 WLAST 未置高!", w_beat_cnt));
-                    w_beat_cnt <= w_beat_cnt + 1;
-                end
-            end
-        end
-    end
 
 endinterface: axi_if

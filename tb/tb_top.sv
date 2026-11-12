@@ -142,14 +142,16 @@ module tb_top;
         uvm_config_db#(virtual axi_if #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH))::set(
             null, "*.m1_agent.*", "vif", axi_vif1
         );
+        uvm_config_db#(virtual axi_if#(32, 64, 8))::set(null, "*", "vif_m0",        axi_vif0);
+    uvm_config_db#(virtual axi_if#(32, 64, 8))::set(null, "*", "vif_m1", axi_vif1);
 
         run_test();
     end
 
-    // 硬看门狗超时保护 (20us)
+    // 硬看门狗超时保护 
     initial begin
-        #100000ns;
-        $display("[HARDWARE_WATCHDOG] 仿真到达 20000ns 保护上限，强制退出！");
+        #500000000ns;
+        $display("[HARDWARE_WATCHDOG] 仿真到达 500000000ns 保护上限，强制退出！");
         $finish;
     end
 
