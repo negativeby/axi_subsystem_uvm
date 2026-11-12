@@ -40,6 +40,7 @@ VCS_FLAGS  = -full64 \
              -fsdb \
              -LDFLAGS "$(LD_FLAGS)" \
              -cm line+cond+fsm+tgl+branch+assert \
+             -cm_hier cov_hier.cfg\
              -l comp.log \
              $(INCDIRS)
 

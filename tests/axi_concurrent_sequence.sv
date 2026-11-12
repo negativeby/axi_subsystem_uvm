@@ -5,166 +5,320 @@
 import uvm_pkg::*;
 import axi_vip_pkg::*;
 
-// ==============================================================
-// 基础子序列: 50/50 双从机真实高频交织、全双工高压流量发生器
-// ==============================================================
-class axi_master_traffic_seq #(
-    int ADDR_WIDTH = 32,
-    int DATA_WIDTH = 64,
-    int ID_WIDTH   = 8
-) extends uvm_sequence #(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH));
+class axi_master_scenario_seq extends uvm_sequence #(axi_transfer #(32, 64, 8));
 
-    localparam STRB_WIDTH = DATA_WIDTH / 8;
+    `uvm_object_utils(axi_master_scenario_seq)
 
-    `uvm_object_param_utils(axi_master_traffic_seq #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH))
+    int unsigned master_id_offset = 0;
+    string       tag              = "M0";
 
-    bit [ADDR_WIDTH-1:0] s0_base_addr = 32'h0000_0000;
-    bit [ADDR_WIDTH-1:0] s1_base_addr = 32'h0001_0000;
-    int unsigned         total_trans  = 80;
-    string               tag          = "M";
+    // 默认单主基数设为 1250，双主合计运行 10,080 笔事务 (支持 +NUM_TRANS=xxxx 动态覆盖)
+    int unsigned base_trans_cnt    = 1250;
+    int unsigned max_ost_per_dir   = 8;
+    int unsigned wr_in_flight_cnt  = 0;
+    int unsigned rd_in_flight_cnt  = 0;
+    int unsigned local_seq_cnt     = 0;
 
-    // 独立 ID 管理：为 M0 和 M1 分配隔离的 ID 起始区间，避免跨 Master 混淆
-    rand bit [ID_WIDTH-1:0] id_base_offset = 0;
-    local bit [ID_WIDTH-1:0] local_id_counter = 0;
+    bit [31:0] s0_wr_min, s0_wr_max;
+    bit [31:0] s0_rd_min, s0_rd_max;
+    bit [31:0] s1_wr_min, s1_wr_max;
+    bit [31:0] s1_rd_min, s1_rd_max;
 
-    function new(string name = "axi_master_traffic_seq");
+    function new(string name = "axi_master_scenario_seq");
         super.new(name);
-        set_response_queue_depth(-1);
     endfunction: new
 
-    virtual task send_trans(
-        input bit                  is_write,
-        input bit [ADDR_WIDTH-1:0] t_addr,
-        input bit [2:0]            t_size,
-        input bit [7:0]            t_len,
-        input bit [1:0]            t_burst
-    );
-        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr, rsp_tr;
-        bit [ID_WIDTH-1:0] current_id;
-
-        tr = axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)::type_id::create($sformatf("%s_tr", tag));
-        
-        // 实例级自增 ID，并加上基地址偏移，彻底杜绝多实例/多轮回归撞 ID
-        current_id = id_base_offset + (local_id_counter++);
-
-        start_item(tr);
-        if (!tr.randomize() with {
-            trans_type == (is_write ? AXI_WRITE : AXI_READ);
-            addr       == t_addr;
-            size       == t_size;
-            len        == t_len;
-            burst      == t_burst;
-            id         == current_id;
-        }) `uvm_fatal("RND_FAIL", "事务随机化失败！")
-
-        if (is_write) begin
-            for (int beat = 0; beat <= tr.len; beat++) begin
-                bit [ADDR_WIDTH-1:0] beat_addr;
-                bit [2:0] lane_offset;
-                beat_addr = (tr.burst == 2'b00) ? tr.addr : tr.addr + (beat * (1 << tr.size));
-                lane_offset = beat_addr[2:0];
-                case (tr.size)
-                    3'b000: tr.strb[beat] = 8'h01 << lane_offset;
-                    3'b001: tr.strb[beat] = 8'h03 << lane_offset;
-                    3'b010: tr.strb[beat] = 8'h0F << lane_offset;
-                    default: tr.strb[beat] = 8'hFF;
-                endcase
-            end
+    function void init_address_map();
+        if (tag == "M0") begin
+            s0_rd_min = 32'h0000_0000; s0_rd_max = 32'h0000_1FFF;
+            s0_wr_min = 32'h0000_2000; s0_wr_max = 32'h0000_3FFF;
+            s1_rd_min = 32'h0001_0000; s1_rd_max = 32'h0001_03FF;
+            s1_wr_min = 32'h0001_0400; s1_wr_max = 32'h0001_07FF;
+        end else begin
+            s0_rd_min = 32'h0000_4000; s0_rd_max = 32'h0000_5FFF;
+            s0_wr_min = 32'h0000_6000; s0_wr_max = 32'h0000_7FFF;
+            s1_rd_min = 32'h0001_0800; s1_rd_max = 32'h0001_0BFF;
+            s1_wr_min = 32'h0001_0C00; s1_wr_max = 32'h0001_0FFF;
         end
+    endfunction: init_address_map
 
-        finish_item(tr);
-        get_response(rsp_tr);
-    endtask: send_trans
+    // 后台独立核销写与读的在途信贷
+    task start_response_collector();
+        fork
+            forever begin
+                axi_transfer #(32, 64, 8) rsp_item;
+                get_response(rsp_item);
+                if (rsp_item.trans_type == AXI_WRITE) begin
+                    if (wr_in_flight_cnt > 0) wr_in_flight_cnt--;
+                end else begin
+                    if (rd_in_flight_cnt > 0) rd_in_flight_cnt--;
+                end
+            end
+        join_none
+    endtask: start_response_collector
+
+    // 阶段 0：读空间非零随机数据预热初始化
+    task prefill_read_regions();
+        for (int i = 0; i < 40; i++) begin
+            axi_transfer #(32, 64, 8) tr;
+            wait (wr_in_flight_cnt < max_ost_per_dir);
+
+            tr = axi_transfer#(32, 64, 8)::type_id::create("tr_prefill");
+            start_item(tr);
+            if (!tr.randomize() with {
+                id == master_id_offset + (local_seq_cnt % 16);
+                trans_type == AXI_WRITE;
+                burst == 2'b01;
+                if (i < 30) {
+                    addr inside {[s0_rd_min : s0_rd_max]};
+                    size == 3'b011;
+                    len  inside {[8'd7 : 8'd15]};
+                } else {
+                    addr inside {[s1_rd_min : s1_rd_max]};
+                    size == 3'b010;
+                    len  == 8'd0;
+                }
+                (addr & ((1 << size) - 1)) == 0;
+            }) begin
+                `uvm_fatal(tag, "阶段 0 预热随机化失败！")
+            end
+            local_seq_cnt++;
+            wr_in_flight_cnt++;
+            finish_item(tr);
+        end
+        wait (wr_in_flight_cnt == 0);
+    endtask: prefill_read_regions
+
+    // 阶段 1：S0 全协议切片、16 种突发长度与 4KB 边界加权随机流
+    task send_crv_s0_protocol_trans(int unsigned num_items);
+        for (int i = 0; i < num_items; i++) begin
+            axi_transfer #(32, 64, 8) tr;
+            int unsigned b_mode;
+            bit          is_wr;
+
+            is_wr  = ($urandom_range(0, 99) < 55);
+            b_mode = $urandom_range(0, 9);
+
+            if (is_wr) wait (wr_in_flight_cnt < max_ost_per_dir);
+            else       wait (rd_in_flight_cnt < max_ost_per_dir);
+
+            tr = axi_transfer#(32, 64, 8)::type_id::create("tr");
+            start_item(tr);
+
+            if (!tr.randomize() with {
+                id dist {
+                    [master_id_offset     : master_id_offset + 1] := 30,
+                    [master_id_offset + 2 : master_id_offset + 7] := 70
+                };
+                trans_type == (is_wr ? AXI_WRITE : AXI_READ);
+                burst == 2'b01;
+
+                size dist { 3'b000 := 25, 3'b001 := 25, 3'b010 := 25, 3'b011 := 25 };
+                len  inside {[8'd0 : 8'd15]};
+
+                if (is_wr) {
+                    addr inside {[s0_wr_min : s0_wr_max]};
+                } else {
+                    addr inside {[s0_rd_min : s0_rd_max]};
+                }
+
+                if (b_mode <= 1) {
+                    // 20% 概率精确顶满 4KB 边界 (Margin == 0)，快速打满 1B/2B/4B/8B 交叉项
+                    ((addr & 32'h0000_0FFF) + ((len + 1) << size)) == 32'h0000_1000;
+                } else if (b_mode == 2) {
+                    // 10% 概率贴近 4KB 边界 (Margin inside 1..16)
+                    ((addr & 32'h0000_0FFF) + ((len + 1) << size)) inside {[32'h0000_0FF0 : 32'h0000_0FFF]};
+                } else {
+                    ((addr & 32'h0000_0FFF) + ((len + 1) << size)) <= 32'h0000_1000;
+                }
+
+                (addr & ((1 << size) - 1)) == 0;
+            }) begin
+                `uvm_fatal(tag, "阶段 1 S0 协议随机化失败！")
+            end
+
+            local_seq_cnt++;
+            if (is_wr) wr_in_flight_cnt++;
+            else       rd_in_flight_cnt++;
+            finish_item(tr);
+        end
+        wait (wr_in_flight_cnt == 0 && rd_in_flight_cnt == 0);
+    endtask: send_crv_s0_protocol_trans
+
+    // 阶段 2：高密度同/异 ID 跨从机路由与异常空洞马尔可夫游走
+    task send_crv_routing_walk_trans(int unsigned num_items);
+        for (int i = 0; i < num_items; i++) begin
+            axi_transfer #(32, 64, 8) tr;
+            int unsigned target_sel;
+            bit          is_wr;
+
+            is_wr = ($urandom_range(0, 99) < 50);
+            if (is_wr) wait (wr_in_flight_cnt < max_ost_per_dir);
+            else       wait (rd_in_flight_cnt < max_ost_per_dir);
+
+            tr = axi_transfer#(32, 64, 8)::type_id::create("tr");
+            start_item(tr);
+
+            randcase
+                35: target_sel = 0; // S0
+                35: target_sel = 1; // S1
+                12: target_sel = 2; // Hole A
+                12: target_sel = 3; // Hole B
+                6:  target_sel = 4; // Hole High
+            endcase
+
+            if (!tr.randomize() with {
+                // 收敛在 4 个 ID 内，高频制造同 ID 同从机、同 ID 异从机、异 ID 乱序三种在途状态
+                id inside {[master_id_offset : master_id_offset + 3]};
+                trans_type == (is_wr ? AXI_WRITE : AXI_READ);
+                burst == 2'b01;
+
+                if (target_sel == 0) {
+                    if (is_wr) addr inside {[s0_wr_min : s0_wr_max]};
+                    else       addr inside {[s0_rd_min : s0_rd_max]};
+                    size inside {[3'b000 : 3'b011]};
+                    len  inside {[8'd0   : 8'd15]};
+                } else if (target_sel == 1) {
+                    if (is_wr) addr inside {[s1_wr_min : s1_wr_max]};
+                    else       addr inside {[s1_rd_min : s1_rd_max]};
+                    size == 3'b010;
+                    len  == 8'd0;
+                } else if (target_sel == 2) {
+                    addr inside {[32'h0000_8000 : 32'h0000_FF00]};
+                    size == 3'b011;
+                    len  == 8'd0;
+                } else if (target_sel == 3) {
+                    addr inside {[32'h0001_1000 : 32'h0001_FF00]};
+                    size == 3'b011;
+                    len  == 8'd0;
+                } else {
+                    addr inside {[32'h0002_0000 : 32'h000F_FF00]};
+                    size == 3'b011;
+                    len  == 8'd0;
+                }
+
+                (addr & ((1 << size) - 1)) == 0;
+            }) begin
+                `uvm_fatal(tag, "阶段 2 路由游走随机化失败！")
+            end
+
+            local_seq_cnt++;
+            if (is_wr) wr_in_flight_cnt++;
+            else       rd_in_flight_cnt++;
+            finish_item(tr);
+        end
+        wait (wr_in_flight_cnt == 0 && rd_in_flight_cnt == 0);
+    endtask: send_crv_routing_walk_trans
+
+    // 阶段 3：全双工读写独立 8+8 在途洪峰压测
+    task send_crv_full_duplex_stress(int unsigned num_items);
+        fork
+            // 独立写洪峰线程 (专属 8 笔写信贷)
+            begin
+                for (int w = 0; w < num_items; w++) begin
+                    axi_transfer #(32, 64, 8) tr_w;
+                    bit to_s1;
+                    wait (wr_in_flight_cnt < max_ost_per_dir);
+
+                    tr_w = axi_transfer#(32, 64, 8)::type_id::create("tr_w");
+                    start_item(tr_w);
+                    to_s1 = ($urandom_range(0, 99) < 35);
+
+                    if (!tr_w.randomize() with {
+                        id inside {[master_id_offset : master_id_offset + 5]};
+                        trans_type == AXI_WRITE;
+                        burst == 2'b01;
+                        if (w < 200) {
+                            aw_delay == 0;
+                            w_delay  == 0;
+                            w_insert_bubble == 1'b0;
+                        }
+                        if (to_s1) {
+                            addr inside {[s1_wr_min : s1_wr_max]};
+                            size == 3'b010;
+                            len  == 8'd0;
+                        } else {
+                            addr inside {[s0_wr_min : s0_wr_max]};
+                            size inside {[3'b000 : 3'b011]};
+                            if (w < 200) len inside {[8'd0 : 8'd1]};
+                            else         len inside {[8'd0 : 8'd15]};
+                        }
+                        (addr & ((1 << size) - 1)) == 0;
+                    }) begin
+                        `uvm_fatal(tag, "阶段 3 异步写随机化失败！")
+                    end
+
+                    wr_in_flight_cnt++;
+                    finish_item(tr_w);
+                end
+            end
+
+            // 独立读洪峰线程 (专属 8 笔读信贷，与写线程零信贷争抢)
+            begin
+                for (int r = 0; r < num_items; r++) begin
+                    axi_transfer #(32, 64, 8) tr_r;
+                    bit to_s1;
+                    wait (rd_in_flight_cnt < max_ost_per_dir);
+
+                    tr_r = axi_transfer#(32, 64, 8)::type_id::create("tr_r");
+                    start_item(tr_r);
+                    to_s1 = ($urandom_range(0, 99) < 35);
+
+                    if (!tr_r.randomize() with {
+                        if (r < 200) {
+                            id inside {[master_id_offset + 8 : master_id_offset + 9]};
+                        } else {
+                            id inside {[master_id_offset + 8 : master_id_offset + 13]};
+                        }
+                        trans_type == AXI_READ;
+                        burst == 2'b01;
+                        if (to_s1) {
+                            addr inside {[s1_rd_min : s1_rd_max]};
+                            size == 3'b010;
+                            len  == 8'd0;
+                        } else {
+                            addr inside {[s0_rd_min : s0_rd_max]};
+                            size inside {[3'b000 : 3'b011]};
+                            len  inside {[8'd0   : 8'd15]};
+                        }
+                        (addr & ((1 << size) - 1)) == 0;
+                    }) begin
+                        `uvm_fatal(tag, "阶段 3 异步读随机化失败！")
+                    end
+
+                    rd_in_flight_cnt++;
+                    finish_item(tr_r);
+                end
+            end
+        join
+
+        wait (wr_in_flight_cnt == 0 && rd_in_flight_cnt == 0);
+    endtask: send_crv_full_duplex_stress
 
     virtual task body();
-        // ----------------------------------------------------------
-        // 阶段 0: 独占基底初始化打底 (串行保证 Scoreboard 账目正确)
-        // ----------------------------------------------------------
-        `uvm_info(tag, $sformatf("[%s] 阶段 0: 灌入 S0 与 S1 专属基底数据...", tag), UVM_LOW)
-        for (int i = 0; i < 32; i++) begin
-            send_trans(1'b1, s0_base_addr + (i * 8), 3'b011, 8'd0, 2'b01);
-        end
-        for (int i = 0; i < 16; i++) begin
-            send_trans(1'b1, s1_base_addr + (i * 8), 3'b011, 8'd0, 2'b01);
-        end
+        void'($value$plusargs("NUM_TRANS=%d", base_trans_cnt));
+        init_address_map();
+        start_response_collector();
 
-        // ----------------------------------------------------------
-        // 阶段 1: 全双工双从机动态交织压测
-        // ----------------------------------------------------------
-        `uvm_info(tag, $sformatf("[%s] 阶段 1: 启动 %0d 笔 S0/S1 全双工高压穿插测试...", tag, total_trans), UVM_LOW)
+        `uvm_info(tag, $sformatf("[%s] 启动万笔级 Multi-Outstanding CRV 压测 | 单向最大在途=%0d | 预计单主总事务=%0d",
+                  tag, max_ost_per_dir, 40 + base_trans_cnt * 4), UVM_LOW)
 
-        for (int i = 0; i < total_trans; i++) begin
-            int rw_sel;
-            bit [2:0] rnd_size;
-            bit [7:0] rnd_len;
-            bit [ADDR_WIDTH-1:0] base;
-            bit [ADDR_WIDTH-1:0] target_addr;
-            bit is_s1_access;
+        prefill_read_regions();
+        send_crv_s0_protocol_trans(base_trans_cnt);
+        send_crv_routing_walk_trans(base_trans_cnt);
+        send_crv_full_duplex_stress(base_trans_cnt);
 
-            rw_sel = $urandom_range(0, 1);
-            is_s1_access = (i % 2 != 0);
-
-            if (!is_s1_access) begin
-                // === S0 (AXI4 RAM): 覆盖各种突发长度与位宽 ===
-                base     = s0_base_addr;
-                rnd_size = $urandom_range(0, 3); // 1B, 2B, 4B, 8B
-                
-                // 轮流生成 single(0), short(1~3), med(4~9), long(10~15)
-                case ((i / 2) % 4)
-                    0: rnd_len = 8'd0;
-                    1: rnd_len = $urandom_range(1, 3);
-                    2: rnd_len = $urandom_range(4, 9);
-                    3: rnd_len = $urandom_range(10, 15);
-                endcase
-
-                target_addr = base + ($urandom_range(0, 12'h300) & ~((1 << rnd_size) - 1));
-
-                // 修复位宽截断：必须使用 16'h1000 或 4096，不能写 12'h1000
-                if (((target_addr & 12'hFFF) + ((rnd_len + 1) * (1 << rnd_size))) > 16'h1000) begin
-                    rnd_len = 8'd0;
-                end
-
-                send_trans(rw_sel[0], target_addr, rnd_size, rnd_len, 2'b01);
-            end
-            else begin
-                // === S1 (AXI-Lite): 严格单拍传输 ===
-                base        = s1_base_addr;
-                rnd_size    = $urandom_range(2, 3);
-                rnd_len     = 8'd0;
-                target_addr = base + ($urandom_range(0, 12'h200) & ~((1 << rnd_size) - 1));
-
-                send_trans(rw_sel[0], target_addr, rnd_size, rnd_len, 2'b01);
-            end
-
-            // 定向 FIXED 模式
-            if (i == 20) begin
-                send_trans(1'b1, s0_base_addr + 12'h700, 3'b011, 8'd1, 2'b00);
-            end
-        end
-
-// ----------------------------------------------------------
-        // 阶段 2: 安全 DECERR（孔洞响应）全覆盖触发 (读/写 + M0/M1)
-        // ----------------------------------------------------------
-        `uvm_info(tag, $sformatf("[%s] 阶段 2: 触发未映射地址 (DECERR) 完整路径...", tag), UVM_LOW)
-
-        // 1. 发起孔洞写事务 -> 覆盖 cp_bresp_status.decerr
-        send_trans(1'b1, 32'h0002_0000, 3'b011, 8'd0, 2'b01);
-
-        // 2. 发起孔洞读事务 -> 覆盖 cp_rresp_status.decerr 与 cross_matrix 读孔洞
-        send_trans(1'b0, 32'h0002_0000, 3'b011, 8'd0, 2'b01);
-
-        `uvm_info(tag, $sformatf("[%s] 全双工交织高压压测完毕！", tag), UVM_LOW)
+        `uvm_info(tag, $sformatf("[%s] 万笔级 CRV 随机序列执行完毕！累计完成事务=%0d", tag, 40 + base_trans_cnt * 4), UVM_LOW)
     endtask: body
 
-endclass: axi_master_traffic_seq
+endclass: axi_master_scenario_seq
 
-
-// ==============================================================
-// 顶级 Virtual Sequence
-// ==============================================================
 class axi_dual_master_vseq extends uvm_sequence;
 
     `uvm_object_utils(axi_dual_master_vseq)
+
+    axi_master_scenario_seq m0_seq;
+    axi_master_scenario_seq m1_seq;
 
     axi_sequencer #(32, 64, 8) m0_sqr;
     axi_sequencer #(32, 64, 8) m1_sqr;
@@ -174,37 +328,23 @@ class axi_dual_master_vseq extends uvm_sequence;
     endfunction: new
 
     virtual task body();
-        axi_master_traffic_seq #(32, 64, 8) m0_seq;
-        axi_master_traffic_seq #(32, 64, 8) m1_seq;
+        `uvm_info("VIRT_SEQ", ">>> 启动双主 10,000+ 事务级 Multi-Outstanding 受约束随机压测 <<<", UVM_LOW)
 
-        if (m0_sqr == null || m1_sqr == null) begin
-            `uvm_fatal("VSEQ_NULL", "m0_sqr 或 m1_sqr 句柄未分配！")
-        end
+        m0_seq = axi_master_scenario_seq::type_id::create("m0_seq");
+        m1_seq = axi_master_scenario_seq::type_id::create("m1_seq");
 
-        `uvm_info("VIRT_SEQ", "==================================================", UVM_LOW)
-        `uvm_info("VIRT_SEQ", "双主完全异步·全双工交织矩阵高压压测启动！", UVM_LOW)
-        `uvm_info("VIRT_SEQ", "==================================================", UVM_LOW)
+        m0_seq.master_id_offset = 8'h00;
+        m0_seq.tag              = "M0";
 
-        m0_seq = axi_master_traffic_seq #(32, 64, 8)::type_id::create("m0_seq");
-        m0_seq.s0_base_addr   = 32'h0000_0000;
-        m0_seq.s1_base_addr   = 32'h0001_0000;
-        m0_seq.total_trans    = 80;
-        m0_seq.tag            = "M0";
-        m0_seq.id_base_offset = 8'h00; // M0 使用 ID 0 ~ 127
-
-        m1_seq = axi_master_traffic_seq #(32, 64, 8)::type_id::create("m1_seq");
-        m1_seq.s0_base_addr   = 32'h0000_2000;
-        m1_seq.s1_base_addr   = 32'h0001_0800;
-        m1_seq.total_trans    = 80;
-        m1_seq.tag            = "M1";
-        m1_seq.id_base_offset = 8'h80; // M1 使用 ID 128 ~ 255 (完美隔离，绝不冲突)
+        m1_seq.master_id_offset = 8'h80;
+        m1_seq.tag              = "M1";
 
         fork
             m0_seq.start(m0_sqr);
             m1_seq.start(m1_sqr);
         join
 
-        `uvm_info("VIRT_SEQ", "全双工双主并发测试执行完毕！", UVM_LOW)
+        `uvm_info("VIRT_SEQ", ">>> 双主 10,000+ 事务级 Multi-Outstanding 受约束随机压测完成！<<<", UVM_LOW)
     endtask: body
 
 endclass: axi_dual_master_vseq

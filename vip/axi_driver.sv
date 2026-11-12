@@ -18,10 +18,11 @@ class axi_driver #(
     axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) wr_q[$];
     axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) rd_q[$];
 
-    // 读在途未决队列 (已发 AR 地址，等待 R 数据的事务)
+    // 在途未决队列 (等待 B 或 R 响应)
+    axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) wr_in_flight_q[$];
     axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) rd_in_flight_q[$];
 
-    localparam int MAX_QUEUE_DEPTH = 8;
+    localparam int MAX_QUEUE_DEPTH = 12;
 
     `uvm_component_param_utils(axi_driver #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH))
 
@@ -43,19 +44,19 @@ class axi_driver #(
 
         wait(vif.rst_n === 1'b1);
         @(posedge vif.clk);
-        `uvm_info("AXI_DRV", "Driver 进入多 Outstanding 解耦全并发就绪状态", UVM_MEDIUM)
+        `uvm_info("AXI_DRV", "Driver 启动：多在途读写流水线 + 阵发性拥塞反压引擎就绪", UVM_LOW)
 
         fork
             fetch_items_process();
-            write_worker_process();
-            ar_worker_process();    // 读地址发射
-            r_worker_process();     // 读数据接收
+            write_worker_process(); // 驱动 AW/W 偏斜并发，不等待 B 响应直接连发下一笔
+            b_worker_process();     // 独立监听 B 通道，注入随机反压与拥塞窗口
+            ar_worker_process();    // 独立连发 AR 地址
+            r_worker_process();     // 独立监听 R 通道，注入随机反压与拥塞窗口
         join
     endtask: run_phase
 
     virtual task reset_signals();
         vif.awvalid <= 1'b0;
-        `uvm_info("DRV_DBG", "[AW] Handshake DONE!", UVM_LOW);
         vif.awid    <= '0;
         vif.awaddr  <= '0;
         vif.awlen   <= '0;
@@ -85,7 +86,6 @@ class axi_driver #(
         vif.rready  <= 1'b0;
     endtask: reset_signals
 
-    // 事务分流器
     virtual task fetch_items_process();
         forever begin
             seq_item_port.get_next_item(req);
@@ -102,30 +102,30 @@ class axi_driver #(
         end
     endtask: fetch_items_process
 
-    // 写工作引擎 (AW, W, B)
+    // 写发射引擎：保证单笔事务内 AW 与 W 自由偏斜交织，且不会跨事务倒置 W 顺序
     virtual task write_worker_process();
         axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr;
         forever begin
-            wait(wr_q.size() > 0);
+            wait(wr_q.size() > 0 && wr_in_flight_q.size() < MAX_QUEUE_DEPTH);
             tr = wr_q.pop_front();
-            drive_write(tr);
 
-            tr.set_id_info(tr);
-            seq_item_port.put_response(tr);
+            // 在开始驱动当前事务时挂入在途队列
+            wr_in_flight_q.push_back(tr);
+
+            fork
+                begin
+                    repeat (tr.aw_delay) @(posedge vif.clk);
+                    drive_aw_channel(tr);
+                end
+                begin
+                    repeat (tr.w_delay) @(posedge vif.clk);
+                    drive_w_channel(tr);
+                end
+            join
         end
     endtask: write_worker_process
 
-    virtual task drive_write(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
-        fork
-            drive_aw_channel(tr);
-            drive_w_channel(tr);
-        join
-        drive_b_channel(tr);
-    endtask: drive_write
-
     virtual task drive_aw_channel(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
-        `uvm_info("DRV_DBG", $sformatf("[%s] [AW] addr=0x%08x, len=%0d, size=%0d Start waiting for awready...", 
-                  get_parent().get_name(), tr.addr, tr.len, tr.size), UVM_LOW)
         @(posedge vif.clk);
         vif.awid    <= tr.id;
         vif.awaddr  <= tr.addr;
@@ -145,21 +145,25 @@ class axi_driver #(
             end
             begin
                 repeat (50000) @(posedge vif.clk);
-                `uvm_error("DRV_TIMEOUT", $sformatf("AW channel ready timeout! addr=0x%08x, wr_q=%0d", tr.addr, wr_q.size()))
+                `uvm_error("DRV_TIMEOUT", $sformatf("AW channel ready timeout! addr=0x%08x", tr.addr))
             end
         join_any
         disable fork;
 
         vif.awvalid <= 1'b0;
-        `uvm_info("DRV_DBG", "[AW] Handshake DONE!", UVM_LOW);
     endtask: drive_aw_channel
 
     virtual task drive_w_channel(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
         int unsigned total_beats = tr.len + 1;
-        `uvm_info("DRV_DBG", "[W] Start sending W beats...", UVM_LOW)
         @(posedge vif.clk);
 
         for (int i = 0; i < total_beats; i++) begin
+            if (tr.w_insert_bubble && (i > 0) && ($urandom_range(0, 99) < 30)) begin
+                vif.wvalid <= 1'b0;
+                vif.wlast  <= 1'b0;
+                repeat ($urandom_range(1, 2)) @(posedge vif.clk);
+            end
+
             vif.wdata  <= tr.data[i];
             vif.wstrb  <= (i < tr.strb.size()) ? tr.strb[i] : {STRB_WIDTH{1'b1}};
             vif.wlast  <= (i == total_beats - 1) ? 1'b1 : 1'b0;
@@ -181,35 +185,57 @@ class axi_driver #(
 
         vif.wvalid <= 1'b0;
         vif.wlast  <= 1'b0;
-        `uvm_info("DRV_DBG", "[W] All W beats DONE!", UVM_LOW);
     endtask: drive_w_channel
 
-    virtual task drive_b_channel(axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr);
-        vif.bready <= 1'b1;
-        
-        fork
-            begin
-                do begin
-                    @(posedge vif.clk);
-                end while (vif.bvalid !== 1'b1);
-            end
-            begin
-                repeat (50000) @(posedge vif.clk);
-                `uvm_error("DRV_TIMEOUT", "B channel response timeout (bvalid stuck low)")
-            end
-        join_any
-        disable fork;
+    virtual task b_worker_process();
+        axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) cur_tr;
+        int match_idx;
+        int unsigned stall_window = 0;
 
-        tr.bresp   = vif.bresp;
-        vif.bready <= 1'b0;
-    endtask: drive_b_channel
+        forever begin
+            @(posedge vif.clk);
+            if (stall_window > 0) begin
+                vif.bready <= 1'b0;
+                stall_window--;
+            end else begin
+                vif.bready <= ($urandom_range(0, 99) < 75);
+            end
 
-    // 读地址发射引擎 (不等待数据，连发 AR)
+            if (vif.bvalid === 1'b1 && vif.bready === 1'b1) begin
+                match_idx = -1;
+                for (int i = 0; i < wr_in_flight_q.size(); i++) begin
+                    if (wr_in_flight_q[i].id == vif.bid) begin
+                        match_idx = i;
+                        break;
+                    end
+                end
+
+                if (match_idx != -1) begin
+                    cur_tr = wr_in_flight_q[match_idx];
+                    cur_tr.bresp = vif.bresp;
+                    wr_in_flight_q.delete(match_idx);
+                    cur_tr.set_id_info(cur_tr);
+                    seq_item_port.put_response(cur_tr);
+                end else begin
+                    `uvm_error("DRV_BID_ERR", $sformatf("收到未知或未在途的 BID=0x%02x!", vif.bid))
+                end
+
+                // b_worker_process 与 r_worker_process 中：
+                if ($urandom_range(0, 99) < 12) begin
+                    stall_window = $urandom_range(24, 40);
+                end
+            end
+        end
+    endtask: b_worker_process
+
     virtual task ar_worker_process();
         axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) tr;
         forever begin
-            wait(rd_q.size() > 0);
+            wait(rd_q.size() < MAX_QUEUE_DEPTH && rd_q.size() > 0 && rd_in_flight_q.size() < MAX_QUEUE_DEPTH);
             tr = rd_q.pop_front();
+
+            tr.data.delete();
+            rd_in_flight_q.push_back(tr);
 
             @(posedge vif.clk);
             vif.arid    <= tr.id;
@@ -236,18 +262,22 @@ class axi_driver #(
             disable fork;
 
             vif.arvalid <= 1'b0;
-            rd_in_flight_q.push_back(tr);
         end
     endtask: ar_worker_process
 
-    // 读数据接收引擎 (后台并行监听 R 通道，拼装数据)
     virtual task r_worker_process();
         axi_transfer #(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH) cur_tr;
         int match_idx;
+        int unsigned stall_window = 0;
 
         forever begin
             @(posedge vif.clk);
-            vif.rready <= 1'b1;
+            if (stall_window > 0) begin
+                vif.rready <= 1'b0;
+                stall_window--;
+            end else begin
+                vif.rready <= ($urandom_range(0, 99) < 80);
+            end
 
             if (vif.rvalid === 1'b1 && vif.rready === 1'b1) begin
                 match_idx = -1;
@@ -267,7 +297,14 @@ class axi_driver #(
                         rd_in_flight_q.delete(match_idx);
                         cur_tr.set_id_info(cur_tr);
                         seq_item_port.put_response(cur_tr);
+
+                        // b_worker_process 与 r_worker_process 中：
+                if ($urandom_range(0, 99) < 12) begin
+                    stall_window = $urandom_range(24, 40);
+                end
                     end
+                end else begin
+                    `uvm_error("DRV_RID_ERR", $sformatf("收到未知或未在途的 RID=0x%02x!", vif.rid))
                 end
             end
         end
