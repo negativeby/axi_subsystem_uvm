@@ -1,4 +1,3 @@
-cat << 'EOF' > ~/axi_xbar_uvm/README.md
 # 2x2 AXI4 / AXI-Lite Crossbar UVM Verification Platform
 
 基于 SystemVerilog 与 UVM-1.2 构建的工业级 **2x2 异构 AXI4 互联矩阵（Crossbar）** 验证平台。本项目采用**“白盒微架构靶向攻关 + 万笔级多在途受约束随机回归（Multi-Outstanding CRV）”**双轨验证策略，成功捕获并修复开源 RTL 中的在途计数器无符号下溢死锁 Bug，实现五维微架构功能覆盖率 **100.00%**、SVA 协议断言覆盖率 **100.00%** 及核心 RTL 代码覆盖率 **89.70%**（行覆盖率 **91.87%** / 分支覆盖率 **91.88%**）签核闭环。
